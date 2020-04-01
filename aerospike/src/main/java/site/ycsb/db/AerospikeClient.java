@@ -18,110 +18,66 @@
 package site.ycsb.db;
 
 import com.aerospike.client.AerospikeException;
-import com.aerospike.client.Bin;
-import com.aerospike.client.Key;
 import com.aerospike.client.Record;
-import com.aerospike.client.policy.ClientPolicy;
-import com.aerospike.client.policy.Policy;
-import com.aerospike.client.policy.RecordExistsAction;
-import com.aerospike.client.policy.WritePolicy;
 import site.ycsb.ByteArrayByteIterator;
 import site.ycsb.ByteIterator;
 import site.ycsb.DBException;
 import site.ycsb.Status;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
-import java.util.Vector;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+import static java.lang.String.format;
+import static java.util.Collections.singletonMap;
 
 /**
  * YCSB binding for <a href="http://www.aerospike.com/">Areospike</a>.
  */
 public class AerospikeClient extends site.ycsb.DB {
-  private static final String DEFAULT_HOST = "localhost";
-  private static final String DEFAULT_PORT = "3000";
-  private static final String DEFAULT_TIMEOUT = "10000";
   private static final String DEFAULT_NAMESPACE = "ycsb";
+  private static final String KEY_FORMAT = "%s_%s";
+  private static final ExecutorService THREAD_POOL = Executors.newCachedThreadPool();
 
-  private String namespace = null;
-
-  private com.aerospike.client.AerospikeClient client = null;
-
-  private Policy readPolicy = new Policy();
-  private WritePolicy insertPolicy = new WritePolicy();
-  private WritePolicy updatePolicy = new WritePolicy();
-  private WritePolicy deletePolicy = new WritePolicy();
+  private String namespace;
+  private ClusterClient clusterClient;
 
   @Override
   public void init() throws DBException {
-    insertPolicy.recordExistsAction = RecordExistsAction.CREATE_ONLY;
-    updatePolicy.recordExistsAction = RecordExistsAction.REPLACE_ONLY;
-
     Properties props = getProperties();
-
     namespace = props.getProperty("as.namespace", DEFAULT_NAMESPACE);
-
-    String host = props.getProperty("as.host", DEFAULT_HOST);
-    String user = props.getProperty("as.user");
-    String password = props.getProperty("as.password");
-    int port = Integer.parseInt(props.getProperty("as.port", DEFAULT_PORT));
-    int timeout = Integer.parseInt(props.getProperty("as.timeout",
-        DEFAULT_TIMEOUT));
-
-    readPolicy.timeout = timeout;
-    insertPolicy.timeout = timeout;
-    updatePolicy.timeout = timeout;
-    deletePolicy.timeout = timeout;
-
-    ClientPolicy clientPolicy = new ClientPolicy();
-
-    if (user != null && password != null) {
-      clientPolicy.user = user;
-      clientPolicy.password = password;
-    }
-
-    try {
-      client =
-          new com.aerospike.client.AerospikeClient(clientPolicy, host, port);
-    } catch (AerospikeException e) {
-      throw new DBException(String.format("Error while creating Aerospike " +
-          "client for %s:%d.", host, port), e);
-    }
+    clusterClient = ClusterClient.newInstance(props);
   }
 
   @Override
   public void cleanup() throws DBException {
-    client.close();
+    clusterClient.close();
   }
 
   @Override
   public Status read(String table, String key, Set<String> fields,
       Map<String, ByteIterator> result) {
     try {
-      Record record;
-
-      if (fields != null) {
-        record = client.get(readPolicy, new Key(namespace, table, key),
-            fields.toArray(new String[fields.size()]));
-      } else {
-        record = client.get(readPolicy, new Key(namespace, table, key));
+      String[] keys = new String[fields.size()];
+      int idx = 0;
+      for (String field : fields) {
+        keys[idx++] = format(KEY_FORMAT, key, field);
       }
+      Record[] records = clusterClient.get(namespace, table, keys);
 
-      if (record == null) {
-        System.err.println("Record key " + key + " not found (read)");
-        return Status.ERROR;
+      for (Record record : records) {
+        if (record == null) {
+          System.err.println("Record key " + key + " not found (read)");
+          return Status.ERROR;
+        }
+        for (Map.Entry<String, Object> entry: record.bins.entrySet()) {
+          result.put(entry.getKey(), new ByteArrayByteIterator((byte[])entry.getValue()));
+        }
       }
-
-      for (Map.Entry<String, Object> entry: record.bins.entrySet()) {
-        result.put(entry.getKey(),
-            new ByteArrayByteIterator((byte[])entry.getValue()));
-      }
-
       return Status.OK;
     } catch (AerospikeException e) {
-      System.err.println("Error while reading key " + key + ": " + e);
+      e.printStackTrace();
       return Status.ERROR;
     }
   }
@@ -133,50 +89,60 @@ public class AerospikeClient extends site.ycsb.DB {
     return Status.ERROR;
   }
 
-  private Status write(String table, String key, WritePolicy writePolicy,
-      Map<String, ByteIterator> values) {
-    Bin[] bins = new Bin[values.size()];
-    int index = 0;
-
-    for (Map.Entry<String, ByteIterator> entry: values.entrySet()) {
-      bins[index] = new Bin(entry.getKey(), entry.getValue().toArray());
-      ++index;
-    }
-
-    Key keyObj = new Key(namespace, table, key);
-
+  @Override
+  public Status update(String table, String key,
+                       Map<String, ByteIterator> values) {
     try {
-      client.put(writePolicy, keyObj, bins);
+      Future<?>[] futures = new Future[values.size()];
+      int idx = 0;
+      for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
+        String customKey = format(KEY_FORMAT, key, entry.getKey());
+        Map<String, ByteIterator> value = singletonMap(entry.getKey(), entry.getValue());
+        futures[idx++] = THREAD_POOL.submit(() -> clusterClient.update(namespace, table, customKey, value));
+      }
+
+      for (Future<?> future : futures) {
+        future.get();
+      }
       return Status.OK;
-    } catch (AerospikeException e) {
-      System.err.println("Error while writing key " + key + ": " + e);
+    } catch (Exception e) {
+      e.printStackTrace();
       return Status.ERROR;
     }
   }
 
   @Override
-  public Status update(String table, String key,
-                       Map<String, ByteIterator> values) {
-    return write(table, key, updatePolicy, values);
-  }
-
-  @Override
   public Status insert(String table, String key,
                        Map<String, ByteIterator> values) {
-    return write(table, key, insertPolicy, values);
+    try {
+      Future<?>[] futures = new Future[values.size()];
+      int idx = 0;
+      for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
+        String customKey = format(KEY_FORMAT, key, entry.getKey());
+        Map<String, ByteIterator> value = singletonMap(entry.getKey(), entry.getValue());
+        futures[idx++] = THREAD_POOL.submit(() -> clusterClient.insert(namespace, table, customKey, value));
+      }
+
+      for (Future<?> future : futures) {
+        future.get();
+      }
+      return Status.OK;
+    } catch (Exception e) {
+      e.printStackTrace();
+      return Status.ERROR;
+    }
   }
 
   @Override
   public Status delete(String table, String key) {
     try {
-      if (!client.delete(deletePolicy, new Key(namespace, table, key))) {
+      if (!clusterClient.delete(namespace, table, key)) {
         System.err.println("Record key " + key + " not found (delete)");
         return Status.ERROR;
       }
-
       return Status.OK;
     } catch (AerospikeException e) {
-      System.err.println("Error while deleting key " + key + ": " + e);
+      e.printStackTrace();
       return Status.ERROR;
     }
   }
